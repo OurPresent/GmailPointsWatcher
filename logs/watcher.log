@@ -2623,3 +2623,10 @@ telegram.error.Conflict: Conflict: terminated by other getUpdates request; make 
 2025-12-11 23:03:06,313 INFO HTTP Request: POST https://api.telegram.org/bot8428323516:AAElzjmSPfUeCoTGKbm7wnDLSZ5ek1-6Gvc/getUpdates "HTTP/1.1 200 OK"
 2025-12-11 23:03:16,462 INFO HTTP Request: POST https://api.telegram.org/bot8428323516:AAElzjmSPfUeCoTGKbm7wnDLSZ5ek1-6Gvc/getUpdates "HTTP/1.1 200 OK"
 2025-12-11 23:03:26,609 INFO HTTP Request: POST https://api.telegram.org/bot8428323516:AAElzjmSPfUeCoTGKbm7wnDLSZ5ek1-6Gvc/getUpdates "HTTP/1.1 200 OK"
+2025-12-11 23:03:36,756 INFO HTTP Request: POST https://api.telegram.org/bot8428323516:AAElzjmSPfUeCoTGKbm7wnDLSZ5ek1-6Gvc/getUpdates "HTTP/1.1 200 OK"
+2025-12-11 23:03:38,748 INFO Running job "_email_job (trigger: interval[0:01:00], next run at: 2025-12-12 04:04:38 UTC)" (scheduled at 2025-12-12 04:03:38.741112+00:00)
+2025-12-11 23:03:46,904 INFO HTTP Request: POST https://api.telegram.org/bot8428323516:AAElzjmSPfUeCoTGKbm7wnDLSZ5ek1-6Gvc/getUpdates "HTTP/1.1 200 OK"
+2025-12-11 23:03:55,833 INFO Job "_email_job (trigger: interval[0:01:00], next run at: 2025-12-12 04:04:38 UTC)" executed successfully
+2025-12-11 23:03:57,051 INFO HTTP Request: POST https://api.telegram.org/bot8428323516:AAElzjmSPfUeCoTGKbm7wnDLSZ5ek1-6Gvc/getUpdates "HTTP/1.1 200 OK"
+2025-12-11 23:04:07,198 INFO HTTP Request: POST https://api.telegram.org/bot8428323516:AAElzjmSPfUeCoTGKbm7wnDLSZ5ek1-6Gvc/getUpdates "HTTP/1.1 200 OK"
+2025-12-11 23:04:17,755 INFO HTTP Request: POST https://api.telegram.org/bot8428323516:AAElzjmSPfUeCoTGKbm7wnDLSZ5ek1-6Gvc/getUpdates "HTTP/1.1 200 OK"

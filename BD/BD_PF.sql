@@ -167,21 +167,21 @@ EXEC dbo.sp_SaveEmailCredential
     @PlainPassword = N'';
 
 
--- Habilitar Database Mail si est� deshabilitado
+-- Habilitar Database Mail si está deshabilitado
 EXEC sp_configure 'show advanced options', 1; RECONFIGURE;
 EXEC sp_configure 'Database Mail XPs', 1; RECONFIGURE;
 
 -- Crear cuenta
 EXEC msdb.dbo.sysmail_add_account_sp
     @account_name = 'CuentaSMTP',
-    @description  = 'Cuenta SMTP para res�menes',
-    @email_address= 'buglione2500@gmail.com',
+    @description  = 'Cuenta SMTP para resumenes',
+    @email_address= 'hola@gmail.com',
     @display_name = 'GlobalPoints Watcher',
     @mailserver_name = 'smtp.gmail.com', -- servidor SMTP
     @port = 587,
     @enable_ssl = 1,
-    @username = 'buglione2500@gmail.com',
-    @password = 'tsvk jljb torw blih';
+    @username = 'hola@gmail.com',
+    @password = '';
 
 -- Crear perfil
 EXEC msdb.dbo.sysmail_add_profile_sp
@@ -196,7 +196,7 @@ EXEC msdb.dbo.sysmail_add_profileaccount_sp
 
 EXEC msdb.dbo.sp_send_dbmail
     @profile_name = 'DefaultProfile',
-    @recipients = 'buglione2500@gmail.com',
+    @recipients = 'hola0@gmail.com',
     @subject = 'Prueba Database Mail',
     @body = 'Mensaje de prueba';
 
@@ -218,7 +218,7 @@ EXEC sp_add_jobstep
     @step_name = N'Ejecutar resumen si es fin de mes',
     @subsystem = N'TSQL',
     @database_name = N'GlobalPointsWatcher',
-    @command = N'EXEC dbo.sp_SendMonthlyIfLastDay @CardLast4=''8624'', @SendTo=''buglione2500@gmail.com'', @ProfileName=''DefaultProfile'';',
+    @command = N'EXEC dbo.sp_SendMonthlyIfLastDay @CardLast4=''8624'', @SendTo=''hola@gmail.com'', @ProfileName=''DefaultProfile'';',
     @on_success_action = 1, -- Quit
     @on_fail_action = 2;    -- Retry/quit
 
