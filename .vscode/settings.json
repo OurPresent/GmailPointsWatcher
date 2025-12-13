@@ -1,0 +1,25 @@
+{
+    "dbcode.connections": [
+        {
+            "connectionId": "ZiHw-4uiajlBRPZBXE5Uv",
+            "name": "Proyecto Final",
+            "driver": "mssql",
+            "color": "#1AAFFF",
+            "host": "DESKTOP-UQTBU3F",
+            "port": 5432,
+            "ssl": false,
+            "driverOptions": {
+                "authType": "sql",
+                "instance": "MSSQLSERVER_2022"
+            },
+            "username": "sa_giovanni",
+            "password": "",
+            "savePassword": "secretStorage",
+            "readOnly": false,
+            "role": "testing",
+            "postConnectionSqlType": "inline",
+            "connectionTimeout": 30,
+            "connectionType": "host"
+        }
+    ]
+}

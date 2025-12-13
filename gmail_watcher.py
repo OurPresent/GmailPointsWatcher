@@ -9,6 +9,14 @@ import argparse
 import logging
 import asyncio
 import csv
+import smtplib
+import pyodbc
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
+import pandas as pd
+from fpdf import FPDF
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CallbackQueryHandler, CommandHandler, MessageHandler, filters
 from datetime import datetime
@@ -40,7 +48,6 @@ CHAT_ID = None
 def _db_connect():
     try:
         if all([MSSQL_SERVER, MSSQL_DATABASE, MSSQL_USER, MSSQL_PASSWORD]):
-            import pyodbc  # type: ignore
             conn = pyodbc.connect(
                 f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={MSSQL_SERVER};DATABASE={MSSQL_DATABASE};UID={MSSQL_USER};PWD={MSSQL_PASSWORD};TrustServerCertificate=yes",
                 timeout=5,
@@ -49,46 +56,6 @@ def _db_connect():
     except Exception as e:
         logging.warning(f"No se pudo conectar a SQL Server: {e}")
     return None
-
-def db_ensure_parameters_table() -> None:
-    conn = _db_connect()
-    if not conn:
-        return
-    try:
-        cur = conn.cursor()
-        # Crear tabla si no existe
-        cur.execute(
-            """
-            IF OBJECT_ID('dbo.Parameters','U') IS NULL
-            CREATE TABLE dbo.Parameters(
-                ParamKey NVARCHAR(50) PRIMARY KEY,
-                ParamValue NVARCHAR(MAX)
-            )
-            """
-        )
-        conn.commit()
-        
-        # Insertar valores por defecto si no existen
-        defaults = {
-            "TELEGRAM_TOKEN": DEFAULT_TELEGRAM_TOKEN,
-            "EMAIL_USERNAME": DEFAULT_EMAIL_USERNAME,
-            "EMAIL_PASSWORD": DEFAULT_EMAIL_PASSWORD,
-            "CHAT_ID": DEFAULT_CHAT_ID
-        }
-        
-        for key, val in defaults.items():
-            cur.execute("SELECT 1 FROM dbo.Parameters WHERE ParamKey = ?", key)
-            if not cur.fetchone():
-                cur.execute("INSERT INTO dbo.Parameters (ParamKey, ParamValue) VALUES (?, ?)", key, val)
-        
-        conn.commit()
-    except Exception as e:
-        logging.error(f"Error asegurando tabla Parameters: {e}")
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
 
 def load_config_from_db() -> bool:
     global TELEGRAM_TOKEN, EMAIL_USERNAME, EMAIL_PASSWORD, CHAT_ID
@@ -198,7 +165,6 @@ class GmailWatcherPython:
     def __init__(self) -> None:
         self.old_points_total = calculate_total_points()
         # Inicializar configuración
-        db_ensure_parameters_table()
         if not load_config_from_db():
             logging.error("No se pudo cargar la configuración crítica. El bot puede fallar.")
         
@@ -210,26 +176,19 @@ class GmailWatcherPython:
         self._tx_pending = {}
         self._pending_card_query = set()
         self._pending_points_action = {} # {chat_id: {"action": "add"|"redeem", "step": "card"|"amount"}}
+        self._pending_report_action = {} # {chat_id: {"step": "month"|"card"|"email", "data": {}}}
         setup_logging()
 
     def start(self) -> None:
-        if CHAT_ID == 1943663667:
-            logging.warning("⚠️ Usando CHAT_ID por defecto (1943663667).")
-        
         self.application.add_handler(CallbackQueryHandler(self._on_card_action, pattern=r"^card:"))
+        self.application.add_handler(CallbackQueryHandler(self._on_report_action, pattern=r"^report:"))
         self.application.add_handler(CallbackQueryHandler(self._on_recognize, pattern=r"^(rec|recdb):"))
         self.application.add_handler(CallbackQueryHandler(self._on_menu, pattern=r"^menu:"))
         self.application.add_handler(CommandHandler("puntos", self._cmd_puntos))
         self.application.add_handler(CommandHandler("start", self._cmd_start))
         self.application.add_handler(CommandHandler("status", self._cmd_status))
         self.application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), self._on_text))
-        try:
-            db_ensure_recognition_table()
-            db_ensure_unrecognized_table()
-            db_ensure_monthly_summary_sp()
-            db_ensure_user_cards_table()
-        except Exception:
-            pass
+        
         self.application.job_queue.run_repeating(self._email_job, interval=TIMEOUT_SECONDS, first=0)
         self.application.run_polling()
 
@@ -393,12 +352,156 @@ class GmailWatcherPython:
             elif key == "start":
                 await self._cmd_start(update, context)
 
+    async def _finalize_report(self, chat_id: int, email_to: str, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if chat_id not in self._pending_report_action:
+            return
+            
+        state = self._pending_report_action[chat_id]
+        offset = state["data"]["offset"]
+        card = state["data"]["card"]
+        
+        # Calculate dates
+        now = datetime.now()
+        if offset == 1:
+            # Previous month
+            dt = now.replace(day=1) - pd.Timedelta(days=1)
+            year, month = dt.year, dt.month
+        else:
+            year, month = now.year, now.month
+            
+        await context.bot.send_message(chat_id=chat_id, text=f"⏳ Generando reporte para {month}/{year} (Tarjeta: {card})...")
+        
+        # Fetch Data
+        data = await asyncio.to_thread(db_fetch_report_data, year, month, card)
+        if not data:
+            await context.bot.send_message(chat_id=chat_id, text="❌ No se encontraron transacciones para el periodo seleccionado.")
+            del self._pending_report_action[chat_id]
+            return
+            
+        # Summary
+        total_pts = sum(int(r['Points']) for r in data)
+        total_usd = sum(float(r['AmountUSD']) for r in data)
+        top_company = max(data, key=lambda x: x['Points'])['Company'] if data else "N/A"
+        
+        summary = {
+            "year": year, "month": month,
+            "points": total_pts, "usd": _fmt2(total_usd),
+            "top_company": top_company
+        }
+        
+        # Generate Files
+        ts = int(time.time())
+        f_excel = f"Reporte_{year}_{month}_{ts}.xlsx"
+        f_pdf = f"Reporte_{year}_{month}_{ts}.pdf"
+        
+        ok_excel = await asyncio.to_thread(create_excel_report, data, f_excel)
+        ok_pdf = await asyncio.to_thread(create_pdf_report, data, summary, f_pdf)
+        
+        files = []
+        if ok_excel: files.append(f_excel)
+        if ok_pdf: files.append(f_pdf)
+        
+        if not files:
+            await context.bot.send_message(chat_id=chat_id, text="❌ Error generando archivos.")
+            del self._pending_report_action[chat_id]
+            return
+            
+        # Send Email
+        subject = f"Resumen de Puntos {month}/{year}"
+        body = (
+            f"Hola,\n\nAdjunto encontrarás el reporte de tus transacciones para {month}/{year}.\n"
+            f"Total Puntos: {total_pts}\n"
+            f"Total USD: ${_fmt2(total_usd)}\n\n"
+            "Saludos,\nTu Bot de Puntos"
+        )
+        
+        sent = await asyncio.to_thread(send_email_report, email_to, subject, body, files)
+        
+        # Cleanup
+        for f in files:
+            try:
+                os.remove(f)
+            except:
+                pass
+                
+        if sent:
+            await context.bot.send_message(chat_id=chat_id, text=f"✅ Reporte enviado a {email_to}")
+        else:
+            await context.bot.send_message(chat_id=chat_id, text="❌ Error enviando el correo. Verifica las credenciales.")
+            
+        del self._pending_report_action[chat_id]
+
+    async def _on_report_action(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        q = update.callback_query
+        if not q or not q.data: return
+        parts = q.data.split(":")
+        action = parts[1]
+        chat_id = q.message.chat_id
+        
+        if chat_id not in self._pending_report_action:
+             # Allow starting from scratch if month selection
+             if action == "month":
+                 self._pending_report_action[chat_id] = {"step": "month", "data": {}}
+             else:
+                 await q.answer("Sesión expirada")
+                 return
+
+        state = self._pending_report_action[chat_id]
+        
+        if action == "month":
+            offset = int(parts[2])
+            state["data"]["offset"] = offset
+            state["step"] = "card"
+            
+            cards = db_get_user_cards(chat_id)
+            kb_rows = []
+            kb_rows.append([InlineKeyboardButton("💳 Todas las Tarjetas", callback_data="report:card:ALL")])
+            for c in cards:
+                label = f"💳 {c['card']}"
+                if c['alias']: label += f" ({c['alias']})"
+                kb_rows.append([InlineKeyboardButton(label, callback_data=f"report:card:{c['card']}")])
+            
+            kb_rows.append([InlineKeyboardButton("❌ Cancelar", callback_data="menu:start")])
+            await q.edit_message_text("Selecciona la tarjeta:", reply_markup=InlineKeyboardMarkup(kb_rows))
+            
+        elif action == "card":
+            card = parts[2]
+            state["data"]["card"] = card
+            state["step"] = "email"
+            
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"📧 Usar {EMAIL_USERNAME}", callback_data="report:email:default")],
+                [InlineKeyboardButton("⌨️ Escribir otro correo", callback_data="report:email:type")],
+                [InlineKeyboardButton("❌ Cancelar", callback_data="menu:start")]
+            ])
+            await q.edit_message_text("¿A qué correo enviarlo?", reply_markup=kb)
+            
+        elif action == "email":
+            sub = parts[2]
+            if sub == "default":
+                await self._finalize_report(chat_id, EMAIL_USERNAME, context)
+            elif sub == "type":
+                await q.edit_message_text("⌨️ Por favor, escribe la dirección de correo electrónico:")
+                # State remains 'email', _on_text will capture it
+
     async def _trigger_email_report(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat_id = update.effective_chat.id
-        await context.bot.send_message(chat_id=chat_id, text="⏳ Ejecutando job de reporte mensual...")
-        success, msg = db_trigger_summary_job()
-        emoji = "✅" if success else "❌"
-        await context.bot.send_message(chat_id=chat_id, text=f"{emoji} {msg}")
+        self._pending_report_action[chat_id] = {"step": "month", "data": {}}
+        
+        now = datetime.now()
+        months_es = ["", "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"]
+        
+        cur_month_name = months_es[now.month]
+        
+        prev_date = now.replace(day=1) - pd.Timedelta(days=1)
+        prev_month_name = months_es[prev_date.month]
+        
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"📅 Mes Actual ({cur_month_name})", callback_data="report:month:0")],
+            [InlineKeyboardButton(f"📅 Mes Anterior ({prev_month_name})", callback_data="report:month:1")],
+            [InlineKeyboardButton("❌ Cancelar", callback_data="menu:start")]
+        ])
+        await context.bot.send_message(chat_id=chat_id, text="📊 **Generar Reporte**\nSelecciona el periodo:", reply_markup=kb, parse_mode="Markdown")
 
     async def _cmd_cards_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat_id = update.effective_chat.id
@@ -543,6 +646,16 @@ class GmailWatcherPython:
     async def _on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat_id = update.effective_chat.id
         text = (update.message.text or "").strip()
+
+        # Handle Report Email Input
+        if chat_id in self._pending_report_action:
+            state = self._pending_report_action[chat_id]
+            if state["step"] == "email":
+                if "@" not in text or "." not in text:
+                    await context.bot.send_message(chat_id=chat_id, text="❌ Por favor, ingresa un correo electrónico válido.")
+                    return
+                await self._finalize_report(chat_id, text, context)
+                return
 
         # Handle Points Action (Add/Redeem/AddCard/EditCard)
         if chat_id in self._pending_points_action:
@@ -781,17 +894,7 @@ def main() -> None:
     parser.add_argument("--year", type=int)
     parser.add_argument("--month", type=int)
     parser.add_argument("--csv", type=str)
-    parser.add_argument("--create-job", action="store_true")
-    parser.add_argument("--job-card", type=str)
-    parser.add_argument("--job-email", type=str)
     args = parser.parse_args()
-
-    if args.create_job and args.job_card and args.job_email:
-        if db_create_summary_job(args.job_card, args.job_email):
-            print(f"Job SQL Server creado para tarjeta {args.job_card} enviando a {args.job_email}")
-        else:
-            print("El Job ya existe o hubo un error al crearlo.")
-        return
 
     if args.totales:
         total_points = calculate_total_points()
@@ -917,10 +1020,7 @@ def db_insert_transaction(company_name: str, bank: str, card_last4: str, total_u
     try:
         cur = conn.cursor()
         cur.execute(
-            """
-            INSERT INTO dbo.Transactions(Company, Bank, CardLast4, AmountUSD, Points, TransactionAt)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
+            "EXEC dbo.sp_InsertTransaction ?, ?, ?, ?, ?, ?",
             company_name,
             bank,
             card_last4,
@@ -931,36 +1031,6 @@ def db_insert_transaction(company_name: str, bank: str, card_last4: str, total_u
         conn.commit()
     except Exception as e:
         logging.error(f"Error insertando transacción en SQL Server: {e}")
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-def db_ensure_recognition_table() -> None:
-    conn = _db_connect()
-    if not conn:
-        return
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            IF OBJECT_ID('dbo.TransactionRecognitions','U') IS NULL
-            CREATE TABLE dbo.TransactionRecognitions(
-            Id INT IDENTITY(1,1) PRIMARY KEY,
-            Token NVARCHAR(128) NOT NULL,
-            Company NVARCHAR(256) NOT NULL,
-            AmountUSD DECIMAL(18,2) NOT NULL,
-            CardLast4 CHAR(4) NOT NULL,
-            Status NVARCHAR(20) NOT NULL,
-            RecognizedAt DATETIME NOT NULL
-            )
-            """
-        )
-        conn.commit()
-        return True
-    except Exception:
-        return False
     finally:
         try:
             conn.close()
@@ -984,61 +1054,6 @@ def db_insert_recognition(token: str, company: str, amount_usd: float, card_last
             card_last4,
             status,
             dt,
-        )
-        conn.commit()
-    except Exception:
-        pass
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-def db_ensure_unrecognized_table() -> None:
-    conn = _db_connect()
-    if not conn:
-        return
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            IF OBJECT_ID('dbo.UnrecognizedTransactions','U') IS NULL
-            CREATE TABLE dbo.UnrecognizedTransactions(
-            Id INT IDENTITY(1,1) PRIMARY KEY,
-            Token NVARCHAR(128) NOT NULL,
-            Company NVARCHAR(256) NOT NULL,
-            AmountUSD DECIMAL(18,2) NOT NULL,
-            CardLast4 CHAR(4) NOT NULL,
-            ReportedAt DATETIME NOT NULL
-            )
-            """
-        )
-        conn.commit()
-    except Exception:
-        pass
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-def db_ensure_user_cards_table() -> None:
-    conn = _db_connect()
-    if not conn:
-        return
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            IF OBJECT_ID('dbo.UserCards','U') IS NULL
-            CREATE TABLE dbo.UserCards(
-                Id INT IDENTITY(1,1) PRIMARY KEY,
-                ChatId BIGINT NOT NULL,
-                CardLast4 CHAR(4) NOT NULL,
-                Alias NVARCHAR(50) NULL,
-                CreatedAt DATETIME DEFAULT GETDATE()
-            )
-            """
         )
         conn.commit()
     except Exception:
@@ -1350,98 +1365,125 @@ def db_monthly_summary(card_last4: str | None) -> Dict[str, Any]:
         except Exception:
             pass
 
-def db_ensure_monthly_summary_sp() -> None:
+def db_fetch_report_data(year: int, month: int, card_last4: str | None) -> list:
     conn = _db_connect()
     if not conn:
-        return
+        return []
     try:
         cur = conn.cursor()
-        cur.execute(
-            """
-            CREATE OR ALTER PROCEDURE dbo.sp_SendMonthlySummaryEmail
-                @CardLast4   CHAR(4),
-                @SendTo      NVARCHAR(256),
-                @ProfileName NVARCHAR(128) = N'DefaultProfile'
-            AS
-            BEGIN
-                SET NOCOUNT ON;
-                -- Report on the previous month since this runs on the 1st
-                DECLARE @Dt DATE = DATEADD(month, -1, GETDATE());
-                DECLARE @Year INT = YEAR(@Dt);
-                DECLARE @Month INT = MONTH(@Dt);
-                DECLARE @TotalPoints INT = 0;
-                DECLARE @TopCompany NVARCHAR(256) = NULL;
-                SELECT @TotalPoints = COALESCE(SUM(Points),0)
-                FROM dbo.Transactions
-                WHERE YEAR(TransactionAt)=@Year AND MONTH(TransactionAt)=@Month AND CardLast4=@CardLast4;
-                SELECT TOP 1 @TopCompany = Company
-                FROM (
-                    SELECT Company, SUM(Points) AS P
-                    FROM dbo.Transactions
-                    WHERE YEAR(TransactionAt)=@Year AND MONTH(TransactionAt)=@Month AND CardLast4=@CardLast4
-                    GROUP BY Company
-                    ORDER BY P DESC
-                ) T
-                ORDER BY P DESC;
-                DECLARE @MonthName NVARCHAR(20) = DATENAME(MONTH, DATEFROMPARTS(@Year, @Month, 1));
-                DECLARE @Subject NVARCHAR(255) = N'Resumen puntos ' + @MonthName + N' ' + CONVERT(NVARCHAR(4), @Year);
-                DECLARE @Body NVARCHAR(MAX) =
-                    N'Resumen mensual ' + @MonthName + N' ' + CONVERT(NVARCHAR(4), @Year) + CHAR(13)+CHAR(10) +
-                    N'Tarjeta terminación: ' + @CardLast4 + CHAR(13)+CHAR(10) +
-                    N'Total puntos: ' + CONVERT(NVARCHAR(50), @TotalPoints) + CHAR(13)+CHAR(10) +
-                    N'Equivalente USD: $' + CONVERT(NVARCHAR(50), CAST(CONVERT(DECIMAL(18,2), @TotalPoints/100.0) AS DECIMAL(18,2))) + CHAR(13)+CHAR(10) +
-                    N'Comercio más consumido: ' + COALESCE(@TopCompany, N'–') + CHAR(13)+CHAR(10);
-                EXEC msdb.dbo.sp_send_dbmail
-                    @profile_name = @ProfileName,
-                    @recipients   = @SendTo,
-                    @subject      = @Subject,
-                    @body         = @Body;
-            END
-            """
-        )
-        conn.commit()
-    except Exception:
-        pass
+        query = """
+            SELECT TransactionAt, Company, AmountUSD, Points, CardLast4, Bank
+            FROM dbo.Transactions
+            WHERE YEAR(TransactionAt)=? AND MONTH(TransactionAt)=?
+        """
+        params = [year, month]
+        if card_last4 and card_last4 != "ALL":
+            query += " AND CardLast4=?"
+            params.append(card_last4)
+        
+        query += " ORDER BY TransactionAt DESC"
+        
+        cur.execute(query, *params)
+        columns = [column[0] for column in cur.description]
+        results = []
+        for row in cur.fetchall():
+            results.append(dict(zip(columns, row)))
+        return results
+    except Exception as e:
+        logging.error(f"Error fetching report data: {e}")
+        return []
     finally:
         try:
             conn.close()
-        except Exception:
+        except:
             pass
 
-def db_create_summary_job(card_last4: str, send_to: str, profile_name: str = 'DefaultProfile') -> bool:
-    conn = _db_connect()
-    if not conn:
+def create_excel_report(data: list, filename: str):
+    if not data:
         return False
     try:
-        cur = conn.cursor()
-        cur.execute("SELECT job_id FROM msdb.dbo.sysjobs WHERE name = 'GlobalPointsMonthlySummary'")
-        r = cur.fetchone()
-        if r:
-            logging.info("El Job 'GlobalPointsMonthlySummary' ya existe. Omitiendo creación.")
-            return False
-        cur.execute(
-            """
-            DECLARE @job_id UNIQUEIDENTIFIER;
-            EXEC msdb.dbo.sp_add_job @job_name = N'GlobalPointsMonthlySummary', @enabled = 1, @job_id = @job_id OUTPUT;
-            EXEC msdb.dbo.sp_add_jobstep @job_name = N'GlobalPointsMonthlySummary', @step_name = N'Send Summary', @subsystem = N'TSQL',
-            @command = N'EXEC dbo.sp_SendMonthlySummaryEmail @CardLast4=''' + ? + ''', @SendTo=''' + ? + ''', @ProfileName=''' + ? + '''';
-            EXEC msdb.dbo.sp_add_schedule @schedule_name = N'MonthlySummarySchedule', @freq_type = 16, @freq_interval = 1, @active_start_time = 80000;
-            EXEC msdb.dbo.sp_attach_schedule @job_name = N'GlobalPointsMonthlySummary', @schedule_name = N'MonthlySummarySchedule';
-            EXEC msdb.dbo.sp_add_jobserver @job_name = N'GlobalPointsMonthlySummary';
-            """,
-            card_last4[:4],
-            send_to,
-            profile_name,
-        )
-        conn.commit()
+        df = pd.DataFrame(data)
+        # Clean datetime for Excel
+        df['TransactionAt'] = df['TransactionAt'].apply(lambda x: x.replace(tzinfo=None) if x else x)
+        df.to_excel(filename, index=False)
         return True
-    except Exception:
+    except Exception as e:
+        logging.error(f"Error creating Excel: {e}")
         return False
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+
+def create_pdf_report(data: list, summary: dict, filename: str):
+    if not data:
+        return False
+    try:
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_font("Arial", 'B', 16)
+        pdf.cell(40, 10, f"Resumen Mensual {summary['month']}/{summary['year']}")
+        pdf.ln(10)
+        
+        pdf.set_font("Arial", '', 12)
+        pdf.cell(0, 10, f"Total Puntos: {summary['points']}", ln=True)
+        pdf.cell(0, 10, f"Equivalente USD: ${summary['usd']}", ln=True)
+        pdf.cell(0, 10, f"Top Comercio: {summary['top_company']}", ln=True)
+        pdf.ln(10)
+        
+        # Table Header
+        pdf.set_font("Arial", 'B', 10)
+        pdf.cell(40, 10, "Fecha", 1)
+        pdf.cell(60, 10, "Comercio", 1)
+        pdf.cell(30, 10, "Monto", 1)
+        pdf.cell(30, 10, "Puntos", 1)
+        pdf.ln()
+        
+        # Table Body
+        pdf.set_font("Arial", '', 10)
+        for row in data:
+            date_str = row['TransactionAt'].strftime("%Y-%m-%d")
+            company = str(row['Company'])[:25] # Truncate
+            amount = f"${row['AmountUSD']}"
+            points = str(row['Points'])
+            
+            pdf.cell(40, 10, date_str, 1)
+            pdf.cell(60, 10, company, 1)
+            pdf.cell(30, 10, amount, 1)
+            pdf.cell(30, 10, points, 1)
+            pdf.ln()
+            
+        pdf.output(filename)
+        return True
+    except Exception as e:
+        logging.error(f"Error creating PDF: {e}")
+        return False
+
+def send_email_report(to_email: str, subject: str, body: str, files: list) -> bool:
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = EMAIL_USERNAME
+        msg['To'] = to_email
+        msg['Subject'] = subject
+        msg.attach(MIMEText(body, 'plain'))
+        
+        for fpath in files:
+            if not os.path.exists(fpath):
+                continue
+            attachment = open(fpath, "rb")
+            p = MIMEBase('application', 'octet-stream')
+            p.set_payload(attachment.read())
+            encoders.encode_base64(p)
+            p.add_header('Content-Disposition', f"attachment; filename= {os.path.basename(fpath)}")
+            msg.attach(p)
+            attachment.close()
+            
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(EMAIL_USERNAME, EMAIL_PASSWORD)
+        text = msg.as_string()
+        server.sendmail(EMAIL_USERNAME, to_email, text)
+        server.quit()
+        return True
+    except Exception as e:
+        logging.error(f"Error sending email: {e}")
+        return False
 
 if __name__ == "__main__":
     main()
