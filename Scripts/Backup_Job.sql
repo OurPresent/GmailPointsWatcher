@@ -43,7 +43,7 @@ DECLARE @fileName NVARCHAR(500)
 
 -- Ajustar la ruta segun la configuracion del servidor. 
 -- Por defecto intentamos usar la carpeta Backup de la instancia MSSQL16 por defecto.
-SET @path = N''C:\Program Files\Microsoft SQL Server\MSSQL16.MSSQLSERVER\MSSQL\Backup\''
+SET @path = N''C:\Program Files\Microsoft SQL Server\MSSQL16.MSSQLSERVER_2022\MSSQL\Backup\''
 
 IF NOT EXISTS (SELECT * FROM sys.databases WHERE name = ''GlobalPointsWatcher'')
 BEGIN
