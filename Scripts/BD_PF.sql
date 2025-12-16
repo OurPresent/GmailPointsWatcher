@@ -6,9 +6,9 @@ IF NOT EXISTS (SELECT * FROM sys.databases WHERE name = 'GlobalPointsWatcher')
 BEGIN
     CREATE DATABASE GlobalPointsWatcher
     ON PRIMARY 
-    ( NAME = N'GlobalPointsWatcher', FILENAME = N'C:\Program Files\Microsoft SQL Server\MSSQL16.MSSQLSERVER\MSSQL\DATA\GlobalPointsWatcher.mdf' , SIZE = 8192KB , MAXSIZE = UNLIMITED, FILEGROWTH = 65536KB )
+    ( NAME = N'GlobalPointsWatcher', FILENAME = N'C:\Program Files\Microsoft SQL Server\MSSQL16.MSSQLSERVER_2022\MSSQL\DATA\GlobalPointsWatcher.mdf' , SIZE = 8192KB , MAXSIZE = UNLIMITED, FILEGROWTH = 65536KB )
     LOG ON 
-    ( NAME = N'GlobalPointsWatcher_log', FILENAME = N'C:\Program Files\Microsoft SQL Server\MSSQL16.MSSQLSERVER\MSSQL\DATA\GlobalPointsWatcher_log.ldf' , SIZE = 8192KB , MAXSIZE = 2048GB , FILEGROWTH = 65536KB )
+    ( NAME = N'GlobalPointsWatcher_log', FILENAME = N'C:\Program Files\Microsoft SQL Server\MSSQL16.MSSQLSERVER_2022\MSSQL\DATA\GlobalPointsWatcher_log.ldf' , SIZE = 8192KB , MAXSIZE = 2048GB , FILEGROWTH = 65536KB )
 END
 GO
 
